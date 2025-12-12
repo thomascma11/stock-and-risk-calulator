@@ -1,0 +1,408 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from statistics import mean, stdev
+import csv
+import os
+from math import isfinite
+
+APP_TITLE = "Stock Return & Risk Calculator"
+
+
+def parse_percent_list(text):
+    """
+    Convert comma-separated percent string to list of decimals.
+    Example: "1.2, -0.5, 0.8" -> [0.012, -0.005, 0.008]
+    """
+    text = text.strip()
+    if not text:
+        return []
+    values = []
+    for token in text.replace("%", "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(float(token) / 100.0)
+    return values
+
+
+def safe_stdev(data):
+    """Standard deviation, or NaN if fewer than 2 points."""
+    return stdev(data) if len(data) >= 2 else float("nan")
+
+
+def fmt_pct(x, places=3):
+    """Format decimal as percentage string."""
+    return f"{x * 100:.{places}f}%"
+
+
+class StockApp(tk.Tk):
+    """Tkinter GUI for the Stock Return & Risk Calculator."""
+
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("840x600")
+        self.minsize(760, 540)
+
+        # CSV-loaded series live here: {ticker: [r1, r2, ...] as decimals}
+        self.csv_series = {}
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill="both", expand=True)
+
+        # Title
+        title_label = ttk.Label(
+            outer, text=APP_TITLE, font=("Segoe UI", 16, "bold")
+        )
+        title_label.pack(anchor="w", pady=(0, 8))
+
+        # Explanation text
+        expl = ttk.Label(
+            outer,
+            text=(
+                "Enter daily percent returns for each stock "
+                "(example: 1.2, -0.5, 0.8) and an optional\n"
+                "risk-free rate per period. The program will compute mean "
+                "return, volatility, and the equal-\n"
+                "weighted portfolio Sharpe ratio."
+            ),
+            justify="left"
+        )
+        expl.pack(anchor="w", pady=(0, 8))
+
+        # ---------- Top input area ----------
+        top_frame = ttk.Frame(outer)
+        top_frame.pack(fill="x", pady=(0, 8))
+
+        # Risk-free rate
+        rf_frame = ttk.Labelframe(top_frame, text="Risk-free rate per period (%)")
+        rf_frame.pack(side="left", padx=(0, 10))
+
+        self.rf_var = tk.StringVar(value="0.0")
+        rf_entry = ttk.Entry(rf_frame, width=10, textvariable=self.rf_var)
+        rf_entry.pack(padx=6, pady=6)
+
+        # Manual stock entries
+        manual_frame = ttk.Labelframe(
+            top_frame, text="Manual Stock Returns (percent per period)"
+        )
+        manual_frame.pack(side="left", fill="both", expand=True)
+
+        self.stock_name_vars = []
+        self.stock_return_vars = []
+
+        for i in range(3):  # allow up to 3 stocks
+            row = ttk.Frame(manual_frame)
+            row.pack(fill="x", padx=6, pady=4)
+
+            name_var = tk.StringVar(value=f"STK{i+1}")
+            ret_var = tk.StringVar()
+
+            ttk.Label(row, text="Ticker:").pack(side="left")
+            ttk.Entry(row, width=8, textvariable=name_var).pack(
+                side="left", padx=(4, 12)
+            )
+
+            ttk.Label(row, text="Returns (%):").pack(side="left")
+            ttk.Entry(row, textvariable=ret_var).pack(
+                side="left", fill="x", expand=True, padx=(4, 0)
+            )
+
+            self.stock_name_vars.append(name_var)
+            self.stock_return_vars.append(ret_var)
+
+        # ---------- CSV area ----------
+        csv_frame = ttk.Labelframe(outer, text="Optional: Load CSV of Returns")
+        csv_frame.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(
+            csv_frame,
+            text=(
+                "CSV format: first row headers are tickers, later rows are percent\n"
+                "returns per period.\n"
+                "Example: AAPL, MSFT, GOOG on the first row, then daily returns "
+                "under each column."
+            ),
+            justify="left",
+        ).pack(anchor="w", padx=6, pady=(4, 2))
+
+        btn_row = ttk.Frame(csv_frame)
+        btn_row.pack(fill="x", padx=6, pady=(0, 6))
+
+        ttk.Button(btn_row, text="Load CSV...", command=self.load_csv).pack(side="left")
+        ttk.Button(btn_row, text="Clear CSV", command=self.clear_csv).pack(
+            side="left", padx=(8, 0)
+        )
+
+        self.csv_status = ttk.Label(
+            csv_frame, text="No CSV loaded.", foreground="#555"
+        )
+        self.csv_status.pack(anchor="w", padx=6, pady=(0, 4))
+
+        # ---------- Action buttons ----------
+        action_row = ttk.Frame(outer)
+        action_row.pack(fill="x", pady=4)
+
+        ttk.Button(action_row, text="Calculate", command=self.calculate).pack(
+            side="left"
+        )
+        ttk.Button(action_row, text="Clear Inputs", command=self.clear_inputs).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(action_row, text="Show Code", command=self.show_code).pack(
+            side="right"
+        )
+
+        # ---------- Results area ----------
+        results_frame = ttk.Labelframe(outer, text="Results")
+        results_frame.pack(fill="both", expand=True, pady=(4, 0))
+
+        columns = ("Ticker", "Mean Return", "Volatility")
+
+        self.tree = ttk.Treeview(
+            results_frame, columns=columns, show="headings", height=6
+        )
+
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, anchor="center", width=150)
+
+        self.tree.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.portfolio_label = ttk.Label(
+            results_frame, text="Portfolio: —", font=("Segoe UI", 10, "bold")
+        )
+        self.portfolio_label.pack(anchor="w", padx=6, pady=(0, 4))
+
+        self.note_label = ttk.Label(
+            results_frame, text="", foreground="#666", justify="left", wraplength=800
+        )
+        self.note_label.pack(anchor="w", padx=6, pady=(0, 6))
+
+    # ------------------------------------------------------------------
+    # Helper methods
+    # ------------------------------------------------------------------
+
+    def clear_inputs(self):
+        """Reset all input and output fields."""
+        self.rf_var.set("0.0")
+
+        for name_var, ret_var in zip(self.stock_name_vars, self.stock_return_vars):
+            name_var.set("")
+            ret_var.set("")
+
+        self.clear_csv()
+        self.tree.delete(*self.tree.get_children())
+        self.portfolio_label.config(text="Portfolio: —")
+        self.note_label.config(text="")
+
+    # ----- CSV handling -----
+
+    def load_csv(self):
+        """Load a CSV file with percent returns."""
+        path = filedialog.askopenfilename(
+            title="Select CSV of percent returns",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+        )
+
+        if not path:
+            return
+
+        try:
+            series = {}
+
+            with open(path, newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+
+            if not rows:
+                raise ValueError("CSV is empty.")
+
+            headers = [h.strip() for h in rows[0] if h.strip()]
+            if not headers:
+                raise ValueError("First row must contain ticker names.")
+
+            for col_index, ticker in enumerate(headers):
+                values = []
+                for r in rows[1:]:
+                    if col_index >= len(r):
+                        break
+                    cell = r[col_index].strip()
+                    if not cell:
+                        continue
+                    values.append(float(cell) / 100.0)
+
+                if values:
+                    series[ticker] = values
+
+            if not series:
+                raise ValueError("No numeric returns found in CSV.")
+
+            self.csv_series = series
+            tickers = ", ".join(series.keys())
+
+            self.csv_status.config(
+                text=f"Loaded {len(series)} ticker(s) from CSV: {tickers}"
+            )
+
+        except Exception as e:
+            messagebox.showerror("CSV Error", f"Could not load CSV file:\n{e}")
+
+    def clear_csv(self):
+        """Forget any CSV-loaded data."""
+        self.csv_series = {}
+        self.csv_status.config(text="No CSV loaded.")
+
+    # ----- Core calculation -----
+
+    def gather_all_series(self):
+        """
+        Combine manual and CSV returns into one dict:
+        {ticker: [r1, r2, ...]} where r's are decimals.
+        CSV overrides manual if the same ticker appears.
+        """
+        data = {}
+
+        # Manual entries
+        for name_var, ret_var in zip(self.stock_name_vars, self.stock_return_vars):
+            ticker = name_var.get().strip().upper()
+            text = ret_var.get()
+
+            if not ticker and not text.strip():
+                continue  # skip empty row
+
+            if not ticker:
+                raise ValueError(
+                    "Ticker symbol cannot be blank if returns are provided."
+                )
+
+            returns = parse_percent_list(text)
+            if returns:
+                data[ticker] = returns
+            else:
+                raise ValueError(f"No valid returns entered for {ticker}.")
+
+        # CSV data (overrides manual)
+        for tkr, series in self.csv_series.items():
+            data[tkr] = series
+
+        if not data:
+            raise ValueError("Please enter manual returns and/or load a CSV first.")
+
+        return data
+
+    def calculate(self):
+        """Main handler for the Calculate button."""
+
+        # 1. Risk-free rate
+        try:
+            rf = float(self.rf_var.get().strip() or "0") / 100.0
+        except ValueError:
+            messagebox.showerror(
+                "Input Error", "Risk-free rate must be a number (percent)."
+            )
+            return
+
+        # 2. Gather and validate return series
+        try:
+            data = self.gather_all_series()
+        except ValueError as e:
+            messagebox.showerror("Input Error", str(e))
+            return
+
+        lengths = [len(v) for v in data.values()]
+        min_len = min(lengths)
+
+        if min_len < 1:
+            messagebox.showerror(
+                "Input Error", "Each stock must have at least one return."
+            )
+            return
+
+        aligned = {t: v[:min_len] for t, v in data.items()}
+
+        note = ""
+        if len(set(lengths)) > 1:
+            note = (
+                f"Note: return series had different lengths; all were truncated "
+                f"to {min_len} period(s) to align them."
+            )
+
+        # 3. Per-stock stats
+        self.tree.delete(*self.tree.get_children())
+        tickers = list(aligned.keys())
+
+        for tkr in tickers:
+            series = aligned[tkr]
+            m = mean(series)
+            s = safe_stdev(series)
+            s_str = "N/A" if not isfinite(s) else fmt_pct(s)
+
+            self.tree.insert("", "end", values=(tkr, fmt_pct(m), s_str))
+
+        # 4. Equal-weighted portfolio stats
+        port_series = []
+        n = len(tickers)
+
+        for i in range(min_len):
+            port_series.append(sum(aligned[t][i] for t in tickers) / n)
+
+        port_mean = mean(port_series)
+        port_vol = safe_stdev(port_series)
+
+        if isfinite(port_vol) and port_vol != 0:
+            sharpe = (port_mean - rf) / port_vol
+        else:
+            sharpe = float("nan")
+
+        mean_str = fmt_pct(port_mean)
+        vol_str = "N/A" if not isfinite(port_vol) else fmt_pct(port_vol)
+        sharpe_str = "N/A" if not isfinite(sharpe) else f"{sharpe:.3f}"
+
+        self.portfolio_label.config(
+            text=(
+                f"Portfolio (equal-weighted across {len(tickers)} stock(s), "
+                f"{min_len} period(s)) "
+                f"Mean: {mean_str} Volatility: {vol_str} "
+                f"Sharpe: {sharpe_str} (risk-free: {fmt_pct(rf)})"
+            )
+        )
+
+        self.note_label.config(text=note)
+
+    # ----- Show code window -----
+
+    def show_code(self):
+        """Open a read-only window showing this program's source code."""
+        top = tk.Toplevel(self)
+        top.title("Program Source Code")
+        top.geometry("900x650")
+
+        text = tk.Text(top, wrap="none")
+        text.pack(fill="both", expand=True)
+
+        yscroll = ttk.Scrollbar(top, orient="vertical", command=text.yview)
+        yscroll.pack(side="right", fill="y")
+        text.configure(yscrollcommand=yscroll.set)
+
+        xscroll = ttk.Scrollbar(top, orient="horizontal", command=text.xview)
+        xscroll.pack(side="bottom", fill="x")
+        text.configure(xscrollcommand=xscroll.set)
+
+        try:
+            path = os.path.abspath(__file__)
+            with open(path, "r", encoding="utf-8") as f:
+                src = f.read()
+        except Exception as e:
+            src = f"Unable to load source code: {e}"
+
+        text.insert("1.0", src)
+        text.config(state="disabled")  # read-only
+
+
+if __name__ == "__main__":
+    app = StockApp()
+    app.mainloop()
