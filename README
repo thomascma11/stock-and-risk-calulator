@@ -1,0 +1,5 @@
+### 📈 Quantitative Finance GUI Tool
+
+Built a Python GUI application that computes key quantitative finance metrics including **mean return**, **volatility**, and **portfolio Sharpe ratio**.  
+Developed automated **data-alignment and cleaning routines** to handle uneven time series, supporting both manual and CSV-based inputs.  
+Designed a **modular architecture** separating the interface, data parsing, and financial logic—enabling future expansion into **weighted portfolios**, **correlation matrices**, and **factor modeling**.
